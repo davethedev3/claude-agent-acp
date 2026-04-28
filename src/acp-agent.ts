@@ -741,6 +741,12 @@ export class ClaudeAcpAgent implements Agent {
     session.promptRunning = true;
     let handedOff = false;
     let stopReason: StopReason = "end_turn";
+    // Synthetic SDKUserMessages with origin.kind === "task-notification" can
+    // be buffered in the iterator between turns and produce a complete
+    // synthetic turn (user + assistant + result + idle) BEFORE our own prompt
+    // echo arrives. Gate the early-return on having seen our own promptUuid so
+    // we don't return the synthetic turn's idle to the user's RPC.
+    let seenOwnPrompt = false;
 
     try {
       while (true) {
@@ -822,7 +828,7 @@ export class ClaudeAcpAgent implements Agent {
                 break;
               }
               case "session_state_changed": {
-                if (message.state === "idle") {
+                if (message.state === "idle" && seenOwnPrompt) {
                   return { stopReason, usage: sessionUsage(session) };
                 }
                 break;
@@ -1023,23 +1029,35 @@ export class ClaudeAcpAgent implements Agent {
             }
 
             // Check for prompt replay
-            if (message.type === "user" && "uuid" in message && message.uuid) {
-              if (message.uuid === promptUuid) {
+            if (message.type === "user") {
+              // Drop synthetic user messages the SDK emits when a backgrounded
+              // task completes. They never carry our promptUuid, never have
+              // isReplay, and falling through would render them as a
+              // user_message_chunk (i.e. "the user typed this").
+              const origin = (message as { origin?: { kind?: string } }).origin;
+              if (origin?.kind === "task-notification") {
                 break;
               }
 
-              const pending = session.pendingMessages.get(message.uuid as string);
-              if (pending) {
-                pending.resolve(false);
-                session.pendingMessages.delete(message.uuid as string);
-                handedOff = true;
-                // the current loop stops with end_turn,
-                // the loop of the next prompt continues running
-                return { stopReason: "end_turn", usage: sessionUsage(session) };
-              }
-              if ("isReplay" in message && message.isReplay) {
-                // not pending or unrelated replay message
-                break;
+              if ("uuid" in message && message.uuid) {
+                if (message.uuid === promptUuid) {
+                  seenOwnPrompt = true;
+                  break;
+                }
+
+                const pending = session.pendingMessages.get(message.uuid as string);
+                if (pending) {
+                  pending.resolve(false);
+                  session.pendingMessages.delete(message.uuid as string);
+                  handedOff = true;
+                  // the current loop stops with end_turn,
+                  // the loop of the next prompt continues running
+                  return { stopReason: "end_turn", usage: sessionUsage(session) };
+                }
+                if ("isReplay" in message && message.isReplay) {
+                  // not pending or unrelated replay message
+                  break;
+                }
               }
             }
 
