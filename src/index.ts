@@ -67,6 +67,14 @@ if (process.argv.includes("--cli")) {
 
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);
+  // SIGHUP: when the agent runs over SSH and the SSH transport disappears
+  // (e.g. Zed remote-development sends SIGKILL to the local SSH client),
+  // the remote shell sends SIGHUP to its child. Without an explicit handler
+  // Node ignores SIGHUP and the agent process leaks. Treat it as a clean
+  // shutdown so the agent exits with its stdio. Windows has no SIGHUP.
+  if (process.platform !== "win32") {
+    process.on("SIGHUP", shutdown);
+  }
 
   // Keep process alive while connection is open
   process.stdin.resume();

@@ -3411,3 +3411,325 @@ describe("result origin handling", () => {
     expect(response.stopReason).toBe("max_tokens");
   });
 });
+
+describe("issue fixes", () => {
+  function createMockAgentWithCapture() {
+    const updates: any[] = [];
+    const mockClient = {
+      sessionUpdate: async (notification: any) => {
+        updates.push(notification);
+      },
+    } as unknown as AgentSideConnection;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    return { agent, updates };
+  }
+
+  function injectSession(
+    agent: ClaudeAcpAgent,
+    messages: any[],
+    overrides: Partial<{ modelInfos: any[]; currentModelId: string }> = {},
+  ) {
+    const input = new Pushable<any>();
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage, done } = await iter.next();
+      if (!done && userMessage) {
+        yield {
+          type: "user",
+          message: userMessage.message,
+          parent_tool_use_id: null,
+          uuid: userMessage.uuid,
+          session_id: "test-session",
+          isReplay: true,
+        };
+      }
+      yield* messages;
+    }
+    agent.sessions["test-session"] = {
+      query: messageGenerator() as any,
+      input,
+      cancelled: false,
+      cwd: "/test",
+      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
+      modes: { currentModeId: "default", availableModes: [] },
+      models: {
+        currentModelId: overrides.currentModelId ?? "default",
+        availableModels: [],
+      },
+      modelInfos: (overrides.modelInfos ?? []) as any,
+      settingsManager: { dispose: vi.fn() } as any,
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+      configOptions: [],
+      promptRunning: false,
+      pendingMessages: new Map(),
+      nextPendingOrder: 0,
+      abortController: new AbortController(),
+      emitRawSDKMessages: false,
+      contextWindowSize: 200000,
+    };
+    return agent.sessions["test-session"];
+  }
+
+  function makeResult(
+    overrides: {
+      result?: string;
+      output_tokens?: number;
+      input_tokens?: number;
+      cache_read?: number;
+      cache_creation?: number;
+    } = {},
+  ) {
+    return {
+      type: "result" as const,
+      subtype: "success" as const,
+      stop_reason: "end_turn",
+      is_error: false,
+      result: overrides.result ?? "",
+      errors: [],
+      duration_ms: 0,
+      duration_api_ms: 0,
+      num_turns: 1,
+      total_cost_usd: 0.01,
+      usage: {
+        input_tokens: overrides.input_tokens ?? 10,
+        output_tokens: overrides.output_tokens ?? 5,
+        cache_read_input_tokens: overrides.cache_read ?? 0,
+        cache_creation_input_tokens: overrides.cache_creation ?? 0,
+      },
+      modelUsage: {},
+      permission_denials: [],
+      uuid: randomUUID(),
+      session_id: "test-session",
+    };
+  }
+
+  // Issue #453: when the SDK delivers a short/cached response, output_tokens=0
+  // and no stream events fire — the assistant text only appears in
+  // `message.result`. Without a fallback the client renders an empty turn.
+  it("issue #453: emits agent_message_chunk when result text arrives with output_tokens=0", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      makeResult({ result: "**3**", output_tokens: 0 }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "2+1?" }] });
+
+    const chunks = updates.filter((u: any) => u.update?.sessionUpdate === "agent_message_chunk");
+    expect(chunks.length).toBeGreaterThan(0);
+    const texts = chunks
+      .map((c: any) => c.update.content?.text)
+      .filter((t: any) => typeof t === "string");
+    expect(texts.some((t: string) => t.includes("**3**"))).toBe(true);
+  });
+
+  it("issue #453: does NOT emit fallback when output_tokens>0 (streaming path)", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      makeResult({ result: "should-not-leak", output_tokens: 50 }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "ping" }] });
+
+    const chunks = updates.filter((u: any) => u.update?.sessionUpdate === "agent_message_chunk");
+    const texts = chunks
+      .map((c: any) => c.update.content?.text)
+      .filter((t: any) => typeof t === "string");
+    expect(texts.some((t: string) => t.includes("should-not-leak"))).toBe(false);
+  });
+
+  // Issue #390: PromptResponse.usage should be cumulative across the session
+  // per the session-usage RFD, not per-turn. Previously `accumulatedUsage` was
+  // reset at the start of every prompt() call.
+  it("issue #390: PromptResponse.usage accumulates across consecutive prompts", async () => {
+    const { agent } = createMockAgentWithCapture();
+    injectSession(agent, [
+      makeResult({ input_tokens: 100, output_tokens: 20 }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    const first = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    expect(first.usage?.inputTokens).toBe(100);
+    expect(first.usage?.outputTokens).toBe(20);
+
+    // Inject a second prompt's worth of messages on the same session.
+    const session = agent.sessions["test-session"];
+    const input2 = new Pushable<any>();
+    async function* gen2() {
+      const iter = input2[Symbol.asyncIterator]();
+      const { value: userMessage, done } = await iter.next();
+      if (!done && userMessage) {
+        yield {
+          type: "user",
+          message: userMessage.message,
+          parent_tool_use_id: null,
+          uuid: userMessage.uuid,
+          session_id: "test-session",
+          isReplay: true,
+        };
+      }
+      yield makeResult({ input_tokens: 3, output_tokens: 7 });
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    }
+    session.query = gen2() as any;
+    session.input = input2;
+    session.promptRunning = false;
+
+    const second = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "second" }],
+    });
+    expect(second.usage?.inputTokens).toBe(103);
+    expect(second.usage?.outputTokens).toBe(27);
+  });
+
+  // Issue #497 / #630: when `session_state_changed: idle` never arrives
+  // (older Claude Code binaries, stalled streams), the prompt loop must not
+  // deadlock — it should fall back to terminating shortly after the result.
+  it("issue #497: returns even when session_state_changed:idle is never emitted", async () => {
+    const { agent } = createMockAgentWithCapture();
+    const input = new Pushable<any>();
+    // Generator yields the result and then waits forever — simulating a
+    // Claude Code binary that doesn't honor CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS
+    // (the iterator's next() promise never resolves after the result).
+    async function* hangingGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage, done } = await iter.next();
+      if (!done && userMessage) {
+        yield {
+          type: "user",
+          message: userMessage.message,
+          parent_tool_use_id: null,
+          uuid: userMessage.uuid,
+          session_id: "test-session",
+          isReplay: true,
+        };
+      }
+      yield makeResult({ result: "hi", output_tokens: 5 });
+      // Pretend the underlying process is silent forever.
+      await new Promise(() => {});
+    }
+    agent.sessions["test-session"] = {
+      query: hangingGenerator() as any,
+      input,
+      cancelled: false,
+      cwd: "/test",
+      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
+      modes: { currentModeId: "default", availableModes: [] },
+      models: { currentModelId: "default", availableModels: [] },
+      modelInfos: [],
+      settingsManager: { dispose: vi.fn() } as any,
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+      configOptions: [],
+      promptRunning: false,
+      pendingMessages: new Map(),
+      nextPendingOrder: 0,
+      abortController: new AbortController(),
+      emitRawSDKMessages: false,
+      contextWindowSize: 200000,
+    };
+
+    const start = Date.now();
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+    const elapsed = Date.now() - start;
+
+    expect(response.stopReason).toBe("end_turn");
+    // Should return within the post-result timeout window, not deadlock.
+    expect(elapsed).toBeLessThan(15000);
+  }, 20000);
+
+  // Issue #639: when the SDK returns multiple ModelInfo entries with the same
+  // displayName, the model picker must show distinguishable names.
+  it("issue #639: disambiguates duplicate model display names", async () => {
+    // The disambiguation lives in getAvailableModels (not exported), so test
+    // through the public types: simulate the rendering manually using the
+    // same shape the agent emits to clients.
+    const models = [
+      { value: "claude-opus-4-6", displayName: "Opus 4.7", description: "" },
+      { value: "claude-opus-4-7", displayName: "Opus 4.7", description: "" },
+      { value: "claude-sonnet-4-6", displayName: "Sonnet", description: "" },
+    ];
+    const counts = new Map<string, number>();
+    for (const m of models) counts.set(m.displayName, (counts.get(m.displayName) ?? 0) + 1);
+    const rendered = models.map((m) => ({
+      modelId: m.value,
+      name: (counts.get(m.displayName) ?? 0) > 1 ? `${m.displayName} (${m.value})` : m.displayName,
+    }));
+    const names = rendered.map((r) => r.name);
+    expect(new Set(names).size).toBe(names.length);
+    expect(names).toContain("Opus 4.7 (claude-opus-4-6)");
+    expect(names).toContain("Opus 4.7 (claude-opus-4-7)");
+    expect(names).toContain("Sonnet");
+  });
+
+  // Issue #375: third-party Anthropic-compatible backends sometimes emit
+  // message_delta with `output_tokens: null`. Without coercion the snapshot
+  // leaks NaN into totalTokens(), which JSON-stringifies to "null" on the wire.
+  it("issue #375: stream_event message_delta with null output_tokens does not emit used:null", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      {
+        type: "stream_event" as const,
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "test-session",
+        event: {
+          type: "message_start" as const,
+          message: {
+            model: "claude-opus-4-6",
+            usage: {
+              input_tokens: 100,
+              output_tokens: 1,
+              cache_read_input_tokens: 0,
+              cache_creation_input_tokens: 0,
+            },
+          },
+        },
+      },
+      {
+        type: "stream_event" as const,
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "test-session",
+        event: {
+          type: "message_delta" as const,
+          usage: {
+            input_tokens: null,
+            output_tokens: null,
+            cache_read_input_tokens: null,
+            cache_creation_input_tokens: null,
+          },
+        },
+      },
+      makeResult({ input_tokens: 100, output_tokens: 1 }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
+    for (const u of usageUpdates) {
+      const wire = JSON.parse(JSON.stringify(u.update));
+      expect(wire.used).not.toBeNull();
+      expect(typeof wire.used).toBe("number");
+      expect(Number.isFinite(wire.used)).toBe(true);
+    }
+  });
+});

@@ -127,6 +127,32 @@ const ZERO_USAGE = Object.freeze({
 
 const DEFAULT_CONTEXT_WINDOW = 200000;
 
+/** Upper bound on how long we wait for `session_state_changed: idle` after a
+ *  non-task-notification `result` arrives before terminating the prompt loop
+ *  ourselves. The new SDK emits idle within milliseconds; older Claude Code
+ *  binaries that don't support `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS` never
+ *  emit it at all. Without this fallback the JSON-RPC response is never sent
+ *  to the client and `conn.prompt()` deadlocks. See acp issues #497 / #630. */
+const POST_RESULT_IDLE_TIMEOUT_MS = 5000;
+
+const POST_RESULT_TIMEOUT_MARKER = Symbol("post-result-idle-timeout");
+
+async function awaitNextWithIdleTimeout<T>(
+  iter: AsyncIterator<T>,
+): Promise<IteratorResult<T> | typeof POST_RESULT_TIMEOUT_MARKER> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      iter.next(),
+      new Promise<typeof POST_RESULT_TIMEOUT_MARKER>((resolve) => {
+        timer = setTimeout(() => resolve(POST_RESULT_TIMEOUT_MARKER), POST_RESULT_IDLE_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 type Session = {
   query: Query;
   input: Pushable<SDKUserMessage>;
@@ -704,12 +730,11 @@ export class ClaudeAcpAgent implements Agent {
     }
 
     session.cancelled = false;
-    session.accumulatedUsage = {
-      inputTokens: 0,
-      outputTokens: 0,
-      cachedReadTokens: 0,
-      cachedWriteTokens: 0,
-    };
+    // `session.accumulatedUsage` is *cumulative across the session* per the
+    // ACP session-usage RFD ("Total input tokens across all turns" etc.) —
+    // do not reset here, otherwise `PromptResponse.usage` only carries the
+    // current turn's counts. Resetting was the historical behavior but it
+    // contradicts the RFD; see acp issue #390.
 
     let lastAssistantTotalUsage: number | null = null;
     let lastAssistantUsage: UsageSnapshot | null = null;
@@ -750,10 +775,25 @@ export class ClaudeAcpAgent implements Agent {
     session.promptRunning = true;
     let handedOff = false;
     let stopReason: StopReason = "end_turn";
+    // After a non-task-notification result arrives the turn is logically over;
+    // the only remaining event we expect is `session_state_changed: idle`,
+    // which the new SDK emits within milliseconds. Older Claude Code binaries
+    // (pre `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS` support) never emit it, and
+    // a stalled underlying stream may also fail to deliver further messages —
+    // both leave `session.query.next()` blocked forever and the JSON-RPC
+    // response unsent. Once `awaitingIdleAfterResult` is set we race the next
+    // iteration against a short timeout so the prompt always returns.
+    let awaitingIdleAfterResult = false;
 
     try {
       while (true) {
-        const { value: message, done } = await session.query.next();
+        const raced = awaitingIdleAfterResult
+          ? await awaitNextWithIdleTimeout(session.query)
+          : await session.query.next();
+        if (raced === POST_RESULT_TIMEOUT_MARKER) {
+          return { stopReason, usage: sessionUsage(session) };
+        }
+        const { value: message, done } = raced;
 
         if (done || !message) {
           if (session.cancelled) {
@@ -831,6 +871,10 @@ export class ClaudeAcpAgent implements Agent {
                 break;
               }
               case "session_state_changed": {
+                // The binary supports state events — clear any pending
+                // post-result timeout fallback since the real lifecycle
+                // signal is flowing.
+                awaitingIdleAfterResult = false;
                 if (message.state === "idle") {
                   return { stopReason, usage: sessionUsage(session) };
                 }
@@ -939,6 +983,24 @@ export class ClaudeAcpAgent implements Agent {
                   )) {
                     await this.client.sessionUpdate(notification);
                   }
+                } else if (
+                  !isTaskNotification &&
+                  message.usage.output_tokens === 0 &&
+                  typeof message.result === "string" &&
+                  message.result.length > 0
+                ) {
+                  // Cached or otherwise short SDK responses sometimes skip
+                  // streaming entirely and deliver the assistant text only on
+                  // the `result` message with output_tokens=0. Without this
+                  // fallback the client renders an empty turn even though the
+                  // answer exists in `message.result`.
+                  await this.client.sessionUpdate({
+                    sessionId: params.sessionId,
+                    update: {
+                      sessionUpdate: "agent_message_chunk",
+                      content: { type: "text", text: message.result },
+                    },
+                  });
                 }
                 break;
               }
@@ -977,6 +1039,14 @@ export class ClaudeAcpAgent implements Agent {
                 unreachable(message, this.logger);
                 break;
             }
+            // A non-task-notification `result` marks the end of the user's
+            // turn from the model's perspective; we still wait for
+            // `session_state_changed: idle` to flush any trailing events, but
+            // arm the post-result timeout so binaries that don't emit it
+            // can't deadlock the prompt loop (issues #497, #630).
+            if (!isTaskNotification) {
+              awaitingIdleAfterResult = true;
+            }
             break;
           }
           case "stream_event": {
@@ -995,7 +1065,7 @@ export class ClaudeAcpAgent implements Agent {
                   // `syncSessionConfigState`, which resets us back to the
                   // default so this branch runs again for the new model.
                   if (session.contextWindowSize === DEFAULT_CONTEXT_WINDOW) {
-                    const inferred = inferContextWindowFromModel(model);
+                    const inferred = inferContextWindowFromModel(model, session.modelInfos);
                     if (inferred !== null) {
                       session.contextWindowSize = inferred;
                     }
@@ -1005,12 +1075,18 @@ export class ClaudeAcpAgent implements Agent {
                 const usage = message.event.usage;
                 const prev: Readonly<UsageSnapshot> = lastAssistantUsage ?? ZERO_USAGE;
                 // Per Anthropic API, message_delta usage fields are *cumulative*;
-                // nullable fields (input_tokens and the cache fields) fall back
-                // to the prior snapshot when the server omits them from this
-                // delta. Only output_tokens is guaranteed non-null.
+                // nullable fields fall back to the prior snapshot when the
+                // server omits them from this delta. output_tokens is typed
+                // non-null by the spec, but third-party Anthropic-compatible
+                // backends (DashScope, internal gateways) have been observed
+                // emitting it as null on short/cached responses. Coerce it
+                // the same way so totalTokens() never returns NaN — JSON
+                // serializes NaN as the literal "null", which produces
+                // `used: null` on the wire and fails schema validation on
+                // the receiving ACP client.
                 lastAssistantUsage = {
                   input_tokens: usage.input_tokens ?? prev.input_tokens,
-                  output_tokens: usage.output_tokens,
+                  output_tokens: usage.output_tokens ?? prev.output_tokens,
                   cache_read_input_tokens:
                     usage.cache_read_input_tokens ?? prev.cache_read_input_tokens,
                   cache_creation_input_tokens:
@@ -1621,7 +1697,8 @@ export class ClaudeAcpAgent implements Agent {
         // to the new model's heuristic so mid-stream updates between now and
         // the next `result` reflect the user's selection instead of the old
         // model's window.
-        session.contextWindowSize = inferContextWindowFromModel(value) ?? DEFAULT_CONTEXT_WINDOW;
+        session.contextWindowSize =
+          inferContextWindowFromModel(value, session.modelInfos) ?? DEFAULT_CONTEXT_WINDOW;
       }
       session.models = { ...session.models, currentModelId: value };
 
@@ -2043,7 +2120,8 @@ export class ClaudeAcpAgent implements Agent {
       abortController,
       emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
       contextWindowSize:
-        inferContextWindowFromModel(models.currentModelId) ?? DEFAULT_CONTEXT_WINDOW,
+        inferContextWindowFromModel(models.currentModelId, initializationResult.models) ??
+        DEFAULT_CONTEXT_WINDOW,
     };
 
     return {
@@ -2392,10 +2470,24 @@ async function getAvailableModels(
 
   await query.setModel(currentModel.value);
 
+  // The SDK can return multiple ModelInfo entries that share displayName when
+  // the user lists several variants of the same family in settings.availableModels
+  // (e.g. claude-opus-4-6 and claude-opus-4-7 both surface as "Opus 4.7").
+  // Surfacing duplicates verbatim leaves the client's model picker with N
+  // indistinguishable rows. Suffix collisions with the underlying modelId so
+  // every option is uniquely identifiable in the UI.
+  const displayNameCounts = new Map<string, number>();
+  for (const model of models) {
+    displayNameCounts.set(model.displayName, (displayNameCounts.get(model.displayName) ?? 0) + 1);
+  }
+
   return {
     availableModels: models.map((model) => ({
       modelId: model.value,
-      name: model.displayName,
+      name:
+        (displayNameCounts.get(model.displayName) ?? 0) > 1
+          ? `${model.displayName} (${model.value})`
+          : model.displayName,
       description: model.description,
     })),
     currentModelId: currentModel.value,
@@ -2883,9 +2975,22 @@ function commonPrefixLength(a: string, b: string) {
  *  until a `result` message arrives with the authoritative `modelUsage` value.
  *  Anthropic 1M-context variants encode "1m" as a distinct token in the SDK
  *  model ID (e.g., "claude-opus-4-6-1m"), which `\b1m\b` catches without also
- *  matching things like "10m" or embedded substrings. */
-function inferContextWindowFromModel(model: string): number | null {
+ *  matching things like "10m" or embedded substrings.
+ *
+ *  Alias modelIds like "default", "opus", "sonnet" don't encode the window in
+ *  their name. When the caller has the model list available, look up the
+ *  matching ModelInfo and probe its displayName + description for the same
+ *  "1m" marker — the SDK already advertises 1M context in human-readable
+ *  text (e.g. "Default (recommended)" → "Opus 4.7 with 1M context"). */
+function inferContextWindowFromModel(model: string, modelInfos?: ModelInfo[]): number | null {
   if (/\b1m\b/i.test(model)) return 1_000_000;
+  if (modelInfos) {
+    const info = modelInfos.find((m) => m.value === model);
+    if (info) {
+      const haystack = `${info.displayName} ${info.description ?? ""}`;
+      if (/\b1m\b/i.test(haystack)) return 1_000_000;
+    }
+  }
   return null;
 }
 
